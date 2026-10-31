@@ -2,7 +2,10 @@ module fyne-ai
 
 go 1.22.0
 
-require fyne.io/fyne/v2 v2.0.0
+require (
+	fyne.io/fyne/v2 v2.0.0
+	github.com/mattn/go-sqlite3 v1.14.32
+)
 
 require (
 	fyne.io/systray v1.12.3-0.20260810170012-af4e8e793ec4 // indirect
