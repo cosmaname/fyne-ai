@@ -7,8 +7,6 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strconv"
-	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -67,7 +65,7 @@ func (s *gridStore) init() error {
 		return err
 	}
 
-	for i := 1; i <= gridSize; i++ {
+	for i := 1; i < gridSize; i++ {
 		if _, err := s.db.Exec(`INSERT INTO grid_rows (id) VALUES (?) ON CONFLICT(id) DO NOTHING`, i); err != nil {
 			return err
 		}
@@ -77,7 +75,7 @@ func (s *gridStore) init() error {
 }
 
 func (s *gridStore) load(entries [][]*cellEntry) error {
-	rows, err := s.db.Query(`SELECT id, one, two, three, four, five, six, seven, eight, nine, ten FROM grid_rows ORDER BY id ASC`)
+	rows, err := s.db.Query(`SELECT id, one, two, three, four, five, six, seven, eight, nine FROM grid_rows WHERE id >= 1 AND id < ? ORDER BY id ASC`, gridSize)
 	if err != nil {
 		return err
 	}
@@ -85,7 +83,7 @@ func (s *gridStore) load(entries [][]*cellEntry) error {
 
 	for rows.Next() {
 		var id int
-		var values [gridSize]string
+		var values [gridSize - 1]string
 		if err := rows.Scan(
 			&id,
 			&values[0],
@@ -97,17 +95,16 @@ func (s *gridStore) load(entries [][]*cellEntry) error {
 			&values[6],
 			&values[7],
 			&values[8],
-			&values[9],
 		); err != nil {
 			return err
 		}
 
-		if id < 1 || id > gridSize {
+		if id < 1 || id >= gridSize {
 			continue
 		}
 
-		for col := 0; col < gridSize; col++ {
-			entries[id-1][col].SetText(values[col])
+		for col := 1; col < gridSize; col++ {
+			entries[id][col].SetText(values[col-1])
 		}
 	}
 
@@ -115,12 +112,12 @@ func (s *gridStore) load(entries [][]*cellEntry) error {
 }
 
 func (s *gridStore) saveCell(row, col int, value string) error {
-	if row < 0 || row >= gridSize || col < 0 || col >= gridSize {
+	if row <= 0 || row >= gridSize || col <= 0 || col >= gridSize {
 		return nil
 	}
 
-	query := fmt.Sprintf("UPDATE grid_rows SET %s = ? WHERE id = ?", columnNames[col])
-	_, err := s.db.Exec(query, value, row+1)
+	query := fmt.Sprintf("UPDATE grid_rows SET %s = ? WHERE id = ?", columnNames[col-1])
+	_, err := s.db.Exec(query, value, row)
 	return err
 }
 
@@ -130,20 +127,20 @@ type cellEntry struct {
 	grid     [][]*cellEntry
 	window   fyne.Window
 	store    *gridStore
+	header   bool
 	editing  bool
-	numeric  bool
 }
 
 func newCellEntry(row, col int, grid [][]*cellEntry, window fyne.Window, store *gridStore) *cellEntry {
 	c := &cellEntry{row: row, col: col, grid: grid, window: window, store: store}
 	c.ExtendBaseWidget(c)
 	c.Wrapping = fyne.TextWrapOff
-	c.numeric = row == 0 || col == 0
+	c.header = row == 0 || col == 0
 	return c
 }
 
 func (c *cellEntry) TypedRune(r rune) {
-	if c.numeric && (r < '0' || r > '9') {
+	if c.header {
 		return
 	}
 	if !c.editing {
@@ -153,6 +150,20 @@ func (c *cellEntry) TypedRune(r rune) {
 }
 
 func (c *cellEntry) TypedKey(ev *fyne.KeyEvent) {
+	if c.header {
+		switch ev.Name {
+		case fyne.KeyUp:
+			c.moveFocus(-1, 0)
+		case fyne.KeyDown:
+			c.moveFocus(1, 0)
+		case fyne.KeyLeft:
+			c.moveFocus(0, -1)
+		case fyne.KeyRight:
+			c.moveFocus(0, 1)
+		}
+		return
+	}
+
 	if c.editing {
 		switch ev.Name {
 		case fyne.KeyReturn, fyne.KeyEnter:
@@ -198,6 +209,9 @@ func (c *cellEntry) moveFocus(dr, dc int) {
 }
 
 func (c *cellEntry) TypedShortcut(shortcut fyne.Shortcut) {
+	if c.header {
+		return
+	}
 	if _, ok := shortcut.(*desktop.CustomShortcut); ok {
 		return
 	}
@@ -210,24 +224,24 @@ func (c *cellEntry) FocusLost() {
 }
 
 func (c *cellEntry) commit() {
-	if c.numeric {
-		t := strings.TrimSpace(c.Text)
-		if t == "" {
-			c.SetText("")
-		} else {
-			v, err := strconv.Atoi(t)
-			if err != nil {
-				c.SetText("")
-			} else {
-				c.SetText(strconv.Itoa(v))
-			}
-		}
+	if c.header {
+		return
 	}
 
 	if c.store != nil {
 		if err := c.store.saveCell(c.row, c.col, c.Text); err != nil {
 			log.Printf("failed saving cell (%d,%d): %v", c.row, c.col, err)
 		}
+	}
+}
+
+func applyReferenceHeaders(entries [][]*cellEntry) {
+	entries[0][0].SetText("")
+	for col := 1; col < gridSize; col++ {
+		entries[0][col].SetText(string(rune('A' + col - 1)))
+	}
+	for row := 1; row < gridSize; row++ {
+		entries[row][0].SetText(fmt.Sprintf("%d", row))
 	}
 }
 
@@ -274,6 +288,7 @@ func main() {
 	if err := store.load(entries); err != nil {
 		log.Fatal(err)
 	}
+	applyReferenceHeaders(entries)
 
 	w.SetContent(grid)
 	w.Resize(fyne.NewSize(900, 420))
