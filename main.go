@@ -7,6 +7,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
@@ -104,7 +106,7 @@ func (s *gridStore) load(entries [][]*cellEntry) error {
 		}
 
 		for col := 1; col < gridSize; col++ {
-			entries[id][col].SetText(values[col-1])
+			entries[id][col].raw = values[col-1]
 		}
 	}
 
@@ -124,11 +126,13 @@ func (s *gridStore) saveCell(row, col int, value string) error {
 type cellEntry struct {
 	widget.Entry
 	row, col int
+	address  string
 	grid     [][]*cellEntry
 	window   fyne.Window
 	store    *gridStore
 	header   bool
 	editing  bool
+	raw      string
 }
 
 func newCellEntry(row, col int, grid [][]*cellEntry, window fyne.Window, store *gridStore) *cellEntry {
@@ -136,6 +140,9 @@ func newCellEntry(row, col int, grid [][]*cellEntry, window fyne.Window, store *
 	c.ExtendBaseWidget(c)
 	c.Wrapping = fyne.TextWrapOff
 	c.header = row == 0 || col == 0
+	if row > 0 && col > 0 {
+		c.address = fmt.Sprintf("%c%d", rune('A'+col-1), row)
+	}
 	return c
 }
 
@@ -186,6 +193,7 @@ func (c *cellEntry) TypedKey(ev *fyne.KeyEvent) {
 	case fyne.KeyRight:
 		c.moveFocus(0, 1)
 	case fyne.KeyReturn, fyne.KeyEnter:
+		c.SetText(c.raw)
 		c.editing = true
 	default:
 		c.Entry.TypedKey(ev)
@@ -220,29 +228,149 @@ func (c *cellEntry) TypedShortcut(shortcut fyne.Shortcut) {
 
 func (c *cellEntry) FocusLost() {
 	c.Entry.FocusLost()
-	c.commit()
+	if c.editing {
+		c.editing = false
+		c.commit()
+	}
 }
 
 func (c *cellEntry) commit() {
 	if c.header {
 		return
 	}
+	c.raw = c.Text
 
 	if c.store != nil {
-		if err := c.store.saveCell(c.row, c.col, c.Text); err != nil {
+		if err := c.store.saveCell(c.row, c.col, c.raw); err != nil {
 			log.Printf("failed saving cell (%d,%d): %v", c.row, c.col, err)
+		}
+	}
+
+	recalculateGrid(c.grid)
+}
+
+func applyReferenceHeaders(entries [][]*cellEntry) {
+	entries[0][0].raw = ""
+	entries[0][0].SetText("")
+	for col := 1; col < gridSize; col++ {
+		header := string(rune('A' + col - 1))
+		entries[0][col].raw = header
+		entries[0][col].SetText(header)
+	}
+	for row := 1; row < gridSize; row++ {
+		header := fmt.Sprintf("%d", row)
+		entries[row][0].raw = header
+		entries[row][0].SetText(header)
+	}
+}
+
+func recalculateGrid(entries [][]*cellEntry) {
+	memo := make(map[string]string)
+	visiting := make(map[string]bool)
+
+	for row := 1; row < gridSize; row++ {
+		for col := 1; col < gridSize; col++ {
+			entries[row][col].SetText(evaluateCell(entries, row, col, memo, visiting))
 		}
 	}
 }
 
-func applyReferenceHeaders(entries [][]*cellEntry) {
-	entries[0][0].SetText("")
-	for col := 1; col < gridSize; col++ {
-		entries[0][col].SetText(string(rune('A' + col - 1)))
+func evaluateCell(entries [][]*cellEntry, row, col int, memo map[string]string, visiting map[string]bool) string {
+	cell := entries[row][col]
+	if val, ok := memo[cell.address]; ok {
+		return val
 	}
-	for row := 1; row < gridSize; row++ {
-		entries[row][0].SetText(fmt.Sprintf("%d", row))
+	if visiting[cell.address] {
+		return "#CYCLE!"
 	}
+
+	visiting[cell.address] = true
+	rawTrimmed := strings.TrimSpace(cell.raw)
+	value := cell.raw
+
+	if strings.HasPrefix(rawTrimmed, "=") {
+		value = evaluateFormula(entries, rawTrimmed[1:], memo, visiting)
+	}
+
+	memo[cell.address] = value
+	delete(visiting, cell.address)
+	return value
+}
+
+func evaluateFormula(entries [][]*cellEntry, expr string, memo map[string]string, visiting map[string]bool) string {
+	parts := strings.Split(expr, "+")
+	if len(parts) == 0 {
+		return "#REF!"
+	}
+
+	var (
+		typeSet      bool
+		numericType  bool
+		numericTotal int
+		textTotal    strings.Builder
+	)
+
+	for _, part := range parts {
+		term := strings.TrimSpace(part)
+		if term == "" {
+			return "#REF!"
+		}
+
+		refRow, refCol, ok := parseCellRef(term)
+		if !ok {
+			return "#REF!"
+		}
+
+		value := evaluateCell(entries, refRow, refCol, memo, visiting)
+		if strings.HasPrefix(value, "#") {
+			return value
+		}
+
+		intVal, err := strconv.Atoi(strings.TrimSpace(value))
+		isNumeric := err == nil
+
+		if !typeSet {
+			typeSet = true
+			numericType = isNumeric
+		} else if numericType != isNumeric {
+			return "#REF!"
+		}
+
+		if isNumeric {
+			numericTotal += intVal
+		} else {
+			textTotal.WriteString(value)
+		}
+	}
+
+	if !typeSet {
+		return "#REF!"
+	}
+
+	if numericType {
+		return strconv.Itoa(numericTotal)
+	}
+
+	return textTotal.String()
+}
+
+func parseCellRef(ref string) (int, int, bool) {
+	normalized := strings.ToUpper(strings.TrimSpace(ref))
+	if len(normalized) < 2 {
+		return 0, 0, false
+	}
+
+	colRune := rune(normalized[0])
+	if colRune < 'A' || colRune > 'I' {
+		return 0, 0, false
+	}
+
+	row, err := strconv.Atoi(normalized[1:])
+	if err != nil || row < 1 || row >= gridSize {
+		return 0, 0, false
+	}
+
+	return row, int(colRune-'A') + 1, true
 }
 
 func main() {
@@ -289,6 +417,7 @@ func main() {
 		log.Fatal(err)
 	}
 	applyReferenceHeaders(entries)
+	recalculateGrid(entries)
 
 	w.SetContent(grid)
 	w.Resize(fyne.NewSize(900, 420))
