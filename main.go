@@ -298,9 +298,17 @@ func evaluateCell(entries [][]*cellEntry, row, col int, memo map[string]string, 
 }
 
 func evaluateFormula(entries [][]*cellEntry, expr string, memo map[string]string, visiting map[string]bool) string {
-	parts := strings.Split(expr, "+")
-	if len(parts) == 0 {
+	terms, ops, ok := parseFormulaTerms(expr)
+	if !ok || len(terms) == 0 || len(terms) != len(ops) {
 		return "#REF!"
+	}
+
+	hasMinus := false
+	for _, op := range ops {
+		if op == '-' {
+			hasMinus = true
+			break
+		}
 	}
 
 	var (
@@ -310,12 +318,7 @@ func evaluateFormula(entries [][]*cellEntry, expr string, memo map[string]string
 		textTotal    strings.Builder
 	)
 
-	for _, part := range parts {
-		term := strings.TrimSpace(part)
-		if term == "" {
-			return "#REF!"
-		}
-
+	for i, term := range terms {
 		refRow, refCol, ok := parseCellRef(term)
 		if !ok {
 			return "#REF!"
@@ -337,8 +340,15 @@ func evaluateFormula(entries [][]*cellEntry, expr string, memo map[string]string
 		}
 
 		if isNumeric {
-			numericTotal += intVal
+			if ops[i] == '-' {
+				numericTotal -= intVal
+			} else {
+				numericTotal += intVal
+			}
 		} else {
+			if hasMinus {
+				return "#REF!"
+			}
 			textTotal.WriteString(value)
 		}
 	}
@@ -352,6 +362,69 @@ func evaluateFormula(entries [][]*cellEntry, expr string, memo map[string]string
 	}
 
 	return textTotal.String()
+}
+
+func parseFormulaTerms(expr string) ([]string, []rune, bool) {
+	trimmed := strings.TrimSpace(expr)
+	if trimmed == "" {
+		return nil, nil, false
+	}
+
+	terms := make([]string, 0, 4)
+	ops := make([]rune, 0, 4)
+
+	i := 0
+	currentOp := rune('+')
+	expectTerm := true
+
+	for i < len(trimmed) {
+		for i < len(trimmed) && trimmed[i] == ' ' {
+			i++
+		}
+		if i >= len(trimmed) {
+			break
+		}
+
+		if expectTerm {
+			if trimmed[i] == '+' || trimmed[i] == '-' {
+				if len(terms) > 0 {
+					return nil, nil, false
+				}
+				currentOp = rune(trimmed[i])
+				i++
+				continue
+			}
+
+			start := i
+			for i < len(trimmed) && trimmed[i] != '+' && trimmed[i] != '-' {
+				i++
+			}
+
+			term := strings.TrimSpace(trimmed[start:i])
+			if term == "" {
+				return nil, nil, false
+			}
+
+			terms = append(terms, term)
+			ops = append(ops, currentOp)
+			currentOp = '+'
+			expectTerm = false
+			continue
+		}
+
+		if trimmed[i] != '+' && trimmed[i] != '-' {
+			return nil, nil, false
+		}
+		currentOp = rune(trimmed[i])
+		i++
+		expectTerm = true
+	}
+
+	if expectTerm {
+		return nil, nil, false
+	}
+
+	return terms, ops, true
 }
 
 func parseCellRef(ref string) (int, int, bool) {
