@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"image/color"
 	"log"
 	"os"
@@ -14,6 +15,17 @@ import (
 )
 
 func main() {
+	cols := flag.Int("cols", 16, "columns including the header (2-27)")
+	rows := flag.Int("rows", 16, "rows including the header (at least 2)")
+	flag.Parse()
+	if *cols < 2 || *cols > 27 {
+		log.Fatalf("columns must be between 2 and 27 (header plus A-Z); got %d", *cols)
+	}
+	if *rows < 2 {
+		log.Fatalf("rows must be at least 2; got %d", *rows)
+	}
+	size := gridSize{rows: *rows, cols: *cols}
+
 	a := app.New()
 	w := a.NewWindow("Hello")
 
@@ -22,7 +34,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	store, err := newGridStore(filepath.Join(wd, "grid.sqlite"))
+	store, err := newGridStore(filepath.Join(wd, "grid.sqlite"), size)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -32,14 +44,14 @@ func main() {
 		}
 	}()
 
-	entries := make([][]*cellEntry, gridSize)
-	for r := 0; r < gridSize; r++ {
-		entries[r] = make([]*cellEntry, gridSize)
+	entries := make([][]*cellEntry, size.rows)
+	for r := range entries {
+		entries[r] = make([]*cellEntry, size.cols)
 	}
 
-	grid := container.NewGridWithColumns(gridSize)
-	for r := 0; r < gridSize; r++ {
-		for c := 0; c < gridSize; c++ {
+	grid := container.NewGridWithColumns(size.cols)
+	for r := 0; r < size.rows; r++ {
+		for c := 0; c < size.cols; c++ {
 			entry := newCellEntry(r, c, entries, w, store)
 			entry.Resize(fyne.NewSize(80, 32))
 			entries[r][c] = entry

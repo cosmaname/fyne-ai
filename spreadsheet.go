@@ -13,21 +13,22 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-const gridSize = 10
-
-var columnNames = [...]string{"one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"}
-
-type gridStore struct {
-	db *sql.DB
+type gridSize struct {
+	rows, cols int
 }
 
-func newGridStore(path string) (*gridStore, error) {
+type gridStore struct {
+	db   *sql.DB
+	size gridSize
+}
+
+func newGridStore(path string, size gridSize) (*gridStore, error) {
 	db, err := sql.Open("sqlite3", path)
 	if err != nil {
 		return nil, err
 	}
 
-	store := &gridStore{db: db}
+	store := &gridStore{db: db, size: size}
 	if err := store.init(); err != nil {
 		_ = db.Close()
 		return nil, err
@@ -41,36 +42,80 @@ func (s *gridStore) Close() error {
 }
 
 func (s *gridStore) init() error {
-	_, err := s.db.Exec(`
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	_, err = tx.Exec(`
 		CREATE TABLE IF NOT EXISTS grid_rows (
-			id INTEGER PRIMARY KEY,
-			one TEXT NOT NULL DEFAULT '',
-			two TEXT NOT NULL DEFAULT '',
-			three TEXT NOT NULL DEFAULT '',
-			four TEXT NOT NULL DEFAULT '',
-			five TEXT NOT NULL DEFAULT '',
-			six TEXT NOT NULL DEFAULT '',
-			seven TEXT NOT NULL DEFAULT '',
-			eight TEXT NOT NULL DEFAULT '',
-			nine TEXT NOT NULL DEFAULT '',
-			ten TEXT NOT NULL DEFAULT ''
+			id INTEGER PRIMARY KEY
 		)
 	`)
 	if err != nil {
 		return err
 	}
 
-	for i := 1; i < gridSize; i++ {
-		if _, err := s.db.Exec(`INSERT INTO grid_rows (id) VALUES (?) ON CONFLICT(id) DO NOTHING`, i); err != nil {
+	columns, err := tx.Query("PRAGMA table_info(grid_rows)")
+	if err != nil {
+		return err
+	}
+	existing := make(map[string]bool)
+	for columns.Next() {
+		var id, notNull, primaryKey int
+		var name, dataType string
+		var defaultValue sql.NullString
+		if err := columns.Scan(&id, &name, &dataType, &notNull, &defaultValue, &primaryKey); err != nil {
+			columns.Close()
+			return err
+		}
+		existing[name] = true
+	}
+	err = columns.Err()
+	columns.Close()
+	if err != nil {
+		return err
+	}
+	// Keep the old schema's data, including columns hidden by a smaller grid.
+	for col, oldName := range []string{"one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"} {
+		if !existing[oldName] {
+			continue
+		}
+		name := columnName(col + 1)
+		if existing[name] {
+			return fmt.Errorf("cannot migrate %s: %s already exists", oldName, name)
+		}
+		if _, err := tx.Exec(fmt.Sprintf("ALTER TABLE grid_rows RENAME COLUMN %s TO %s", oldName, name)); err != nil {
+			return err
+		}
+		existing[name] = true
+	}
+	for col := 1; col < s.size.cols; col++ {
+		name := columnName(col)
+		if !existing[name] {
+			if _, err := tx.Exec(fmt.Sprintf("ALTER TABLE grid_rows ADD COLUMN %s TEXT NOT NULL DEFAULT ''", name)); err != nil {
+				return err
+			}
+		}
+	}
+
+	for i := 1; i < s.size.rows; i++ {
+		if _, err := tx.Exec(`INSERT INTO grid_rows (id) VALUES (?) ON CONFLICT(id) DO NOTHING`, i); err != nil {
 			return err
 		}
 	}
 
-	return nil
+	return tx.Commit()
 }
 
 func (s *gridStore) load(entries [][]*cellEntry) error {
-	rows, err := s.db.Query(`SELECT id, one, two, three, four, five, six, seven, eight, nine FROM grid_rows WHERE id >= 1 AND id < ? ORDER BY id ASC`, gridSize)
+	names := make([]string, s.size.cols-1)
+	for col := 1; col < s.size.cols; col++ {
+		names[col-1] = columnName(col)
+	}
+	query := fmt.Sprintf("SELECT id, %s FROM grid_rows WHERE id >= 1 AND id < ? ORDER BY id ASC", strings.Join(names, ", "))
+	rows, err := s.db.Query(query, s.size.rows)
 	if err != nil {
 		return err
 	}
@@ -78,27 +123,21 @@ func (s *gridStore) load(entries [][]*cellEntry) error {
 
 	for rows.Next() {
 		var id int
-		var values [gridSize - 1]string
-		if err := rows.Scan(
-			&id,
-			&values[0],
-			&values[1],
-			&values[2],
-			&values[3],
-			&values[4],
-			&values[5],
-			&values[6],
-			&values[7],
-			&values[8],
-		); err != nil {
+		values := make([]string, len(names))
+		dest := make([]any, s.size.cols)
+		dest[0] = &id
+		for col := range values {
+			dest[col+1] = &values[col]
+		}
+		if err := rows.Scan(dest...); err != nil {
 			return err
 		}
 
-		if id < 1 || id >= gridSize {
+		if id < 1 || id >= s.size.rows {
 			continue
 		}
 
-		for col := 1; col < gridSize; col++ {
+		for col := 1; col < s.size.cols; col++ {
 			entries[id][col].raw = values[col-1]
 		}
 	}
@@ -107,13 +146,17 @@ func (s *gridStore) load(entries [][]*cellEntry) error {
 }
 
 func (s *gridStore) saveCell(row, col int, value string) error {
-	if row <= 0 || row >= gridSize || col <= 0 || col >= gridSize {
+	if row <= 0 || row >= s.size.rows || col <= 0 || col >= s.size.cols {
 		return nil
 	}
 
-	query := fmt.Sprintf("UPDATE grid_rows SET %s = ? WHERE id = ?", columnNames[col-1])
+	query := fmt.Sprintf("UPDATE grid_rows SET %s = ? WHERE id = ?", columnName(col))
 	_, err := s.db.Exec(query, value, row)
 	return err
+}
+
+func columnName(col int) string {
+	return fmt.Sprintf("col_%d", col)
 }
 
 type cellEntry struct {
@@ -196,7 +239,7 @@ func (c *cellEntry) TypedKey(ev *fyne.KeyEvent) {
 func (c *cellEntry) moveFocus(dr, dc int) {
 	nr := c.row + dr
 	nc := c.col + dc
-	if nr < 0 || nr >= gridSize || nc < 0 || nc >= gridSize {
+	if nr < 0 || nr >= len(c.grid) || nc < 0 || nc >= len(c.grid[nr]) {
 		return
 	}
 
@@ -245,12 +288,12 @@ func (c *cellEntry) commit() {
 func applyReferenceHeaders(entries [][]*cellEntry) {
 	entries[0][0].raw = ""
 	entries[0][0].SetText("")
-	for col := 1; col < gridSize; col++ {
+	for col := 1; col < len(entries[0]); col++ {
 		header := string(rune('A' + col - 1))
 		entries[0][col].raw = header
 		entries[0][col].SetText(header)
 	}
-	for row := 1; row < gridSize; row++ {
+	for row := 1; row < len(entries); row++ {
 		header := fmt.Sprintf("%d", row)
 		entries[row][0].raw = header
 		entries[row][0].SetText(header)
@@ -261,8 +304,8 @@ func recalculateGrid(entries [][]*cellEntry) {
 	memo := make(map[string]string)
 	visiting := make(map[string]bool)
 
-	for row := 1; row < gridSize; row++ {
-		for col := 1; col < gridSize; col++ {
+	for row := 1; row < len(entries); row++ {
+		for col := 1; col < len(entries[row]); col++ {
 			entries[row][col].SetText(evaluateCell(entries, row, col, memo, visiting))
 		}
 	}
@@ -312,7 +355,7 @@ func evaluateFormula(entries [][]*cellEntry, expr string, memo map[string]string
 	)
 
 	for i, term := range terms {
-		refRow, refCol, ok := parseCellRef(term)
+		refRow, refCol, ok := parseCellRef(term, gridSize{rows: len(entries), cols: len(entries[0])})
 		if !ok {
 			return "#REF!"
 		}
@@ -420,19 +463,19 @@ func parseFormulaTerms(expr string) ([]string, []rune, bool) {
 	return terms, ops, true
 }
 
-func parseCellRef(ref string) (int, int, bool) {
+func parseCellRef(ref string, size gridSize) (int, int, bool) {
 	normalized := strings.ToUpper(strings.TrimSpace(ref))
 	if len(normalized) < 2 {
 		return 0, 0, false
 	}
 
 	colRune := rune(normalized[0])
-	if colRune < 'A' || colRune > 'I' {
+	if colRune < 'A' || int(colRune-'A')+1 >= size.cols {
 		return 0, 0, false
 	}
 
 	row, err := strconv.Atoi(normalized[1:])
-	if err != nil || row < 1 || row >= gridSize {
+	if err != nil || row < 1 || row >= size.rows {
 		return 0, 0, false
 	}
 
